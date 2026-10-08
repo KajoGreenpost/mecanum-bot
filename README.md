@@ -162,6 +162,21 @@ powershell -ExecutionPolicy Bypass -File .\tools\hashes.ps1
 
 ## Website updates
 
+For the React website in the sibling `mecanum-bot-website` checkout, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build-web.ps1
+```
+
+This runs the regression tests, builds the website, copies the current bundles
+into `data/`, writes the package version, and creates `littlefs.bin`. Install
+dependencies once with `npm ci` in the website checkout. Upload the resulting
+`littlefs.bin` at `/maintenance` under **Webinterface Update**, then reload the
+control page. Web UI 1.1.1 fixes repeated settings reloads and reduces disarmed
+control traffic to one request per second. The armed heartbeat remains 20 Hz;
+the existing firmware's 300 ms watchdog remains in effect. This fix requires
+only a website update.
+
 1. Generate/edit the static website.
 2. Put the output in `data/`.
 3. Increase `data/version.txt` independently from `FW_VERSION`.
