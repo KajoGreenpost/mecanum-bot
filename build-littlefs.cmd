@@ -2,8 +2,13 @@
 setlocal
 cd /d "%~dp0"
 
+echo.
+echo ==========================================
+echo   MecanumBot - LittleFS BIN erstellen
+echo ==========================================
+echo.
+
 if not exist "tools\build-littlefs.ps1" (
-  echo.
   echo FEHLER: tools\build-littlefs.ps1 wurde nicht gefunden.
   echo Erwarteter Pfad:
   echo %CD%\tools\build-littlefs.ps1
@@ -11,12 +16,6 @@ if not exist "tools\build-littlefs.ps1" (
   pause
   exit /b 1
 )
-
-echo.
-echo ==========================================
-echo   MecanumBot - LittleFS BIN erstellen
-echo ==========================================
-echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\tools\build-littlefs.ps1"
 set "ERR=%ERRORLEVEL%"
@@ -29,17 +28,17 @@ if not "%ERR%"=="0" (
   exit /b %ERR%
 )
 
-echo ==========================================
-echo   Fertig.
-echo ==========================================
-echo.
-
-if exist "littlefs.bin" (
-  echo Erstellt:
+if exist "%CD%\littlefs.bin" (
+  echo ==========================================
+  echo   LITTLEFS BUILD ERFOLGREICH
+  echo ==========================================
+  echo.
+  echo Datei:
   echo %CD%\littlefs.bin
+  echo.
+  powershell.exe -NoProfile -Command "(Get-FileHash '%CD%\littlefs.bin' -Algorithm SHA256).Hash.ToLower()"
 ) else (
-  echo Der PowerShell-Build wurde ohne Fehler beendet,
-  echo aber littlefs.bin wurde im Projektordner nicht gefunden.
+  echo FEHLER: littlefs.bin wurde nicht gefunden.
 )
 
 echo.
