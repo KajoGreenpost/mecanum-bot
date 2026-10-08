@@ -8,7 +8,7 @@ echo   MecanumBot - Firmware BIN erstellen
 echo ==========================================
 echo.
 
-set "SKETCH=%CD%\MecanumBot.ino"
+set "SKETCH=%CD%\mecanum-bot.ino"
 set "BUILD_DIR=%CD%\build"
 set "OUT_BIN=%CD%\firmware.bin"
 
