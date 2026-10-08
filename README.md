@@ -177,6 +177,14 @@ control traffic to one request per second. The armed heartbeat remains 20 Hz;
 the existing firmware's 300 ms watchdog remains in effect. This fix requires
 only a website update.
 
+Web UI 1.1.2 adds a phone landscape controller with a single compact toolbar,
+height-scaled sticks and a dedicated center activation/stop button. The brand
+header is hidden on short landscape screens. Driving has no scroll container;
+settings and system keep touch scrolling. Phones in portrait show a rotation
+prompt and automatically disarm. Layout checks (including two simultaneous
+touches) can be run with `npm run test:layout` in the website checkout; install
+the browser once with `npx playwright install chromium` if needed.
+
 1. Generate/edit the static website.
 2. Put the output in `data/`.
 3. Increase `data/version.txt` independently from `FW_VERSION`.
