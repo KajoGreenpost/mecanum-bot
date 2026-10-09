@@ -16,7 +16,7 @@
 // VERSION
 // =====================================================
 
-const char *FW_VERSION = "1.0.0";
+const char *FW_VERSION = "1.0.2";
 
 // =====================================================
 // WIFI ACCESS POINT
@@ -54,14 +54,17 @@ bool recoveryMode = false;
 // MOTOR PINS
 // =====================================================
 
-const int FL_IN1 = 5;
-const int FL_IN2 = 18;
-const int FR_IN1 = 19;
-const int FR_IN2 = 21;
-const int RL_IN1 = 2;
-const int RL_IN2 = 4;
-const int RR_IN1 = 16;
-const int RR_IN2 = 17;
+// Calibrated from the reported Y+, turn+, X+ wheel tests (all inversions off).
+// Physical FL = old RL reversed, FR = old RR, RL = old FR reversed, RR = old FL.
+// Swapping the left IN pairs corrects polarity without requiring UI inversions.
+const int FL_IN1 = 4;
+const int FL_IN2 = 2;
+const int FR_IN1 = 16;
+const int FR_IN2 = 17;
+const int RL_IN1 = 21;
+const int RL_IN2 = 19;
+const int RR_IN1 = 5;
+const int RR_IN2 = 18;
 const int STBY_PIN = 27;
 
 // =====================================================
@@ -121,6 +124,34 @@ const unsigned long CONTROL_INTERVAL_MS = 10;
 unsigned long lastControlPacketMs = 0;
 unsigned long lastControlUpdateMs = 0;
 bool validControlPacketReceived = false;
+
+// Bounded diagnostics: no flash writes, no logging while disabled.
+const size_t DEBUG_LINES = 32;
+const size_t DEBUG_LINE_LENGTH = 160;
+const unsigned long DEBUG_LEASE_MS = 10000;
+struct DebugEntry { uint32_t id; unsigned long ms; char text[DEBUG_LINE_LENGTH]; };
+DebugEntry debugEntries[DEBUG_LINES];
+uint32_t debugSequence = 0;
+uint32_t debugBootId = 0;
+bool debugEnabled = false;
+unsigned long debugLastReadMs = 0;
+unsigned long debugLastStateMs = 0;
+int debugPWM[4] = {0, 0, 0, 0};
+
+void debugLog(const char *message) {
+  if (!debugEnabled) return;
+  DebugEntry &entry = debugEntries[debugSequence % DEBUG_LINES];
+  entry.id = ++debugSequence;
+  entry.ms = millis();
+  snprintf(entry.text, sizeof(entry.text), "%s", message);
+}
+
+void expireDebug() {
+  if (debugEnabled && millis() - debugLastReadMs > DEBUG_LEASE_MS) {
+    debugLog("DEBUG stopped: no diagnostic reader for 10 seconds");
+    debugEnabled = false;
+  }
+}
 
 // =====================================================
 // BOOST STATE
@@ -361,6 +392,7 @@ int normalizedToPWM(float value) {
 }
 
 void stopAllMotors() {
+  for (int i = 0; i < 4; i++) debugPWM[i] = 0;
   ledcWrite(CH_FL_1, 0);
   ledcWrite(CH_FL_2, 0);
   ledcWrite(CH_FR_1, 0);
@@ -489,14 +521,22 @@ void driveMecanum() {
   rr *= speedFactor;
 
   applyStartMinimum(fl, fr, rl, rr, speedFactor);
-  applyGlobalBoost(fl, fr, rl, rr, speedFactor);
+  // Breakaway torque is independent of the selected running power limit.
+  // Only the short configured boost may exceed 60%/80%; afterwards the cap resumes.
+  applyGlobalBoost(fl, fr, rl, rr, 1.0f);
+  bool boostActive = vehicleWasMoving && (int32_t)(globalBoostUntilMs - millis()) > 0;
+  float outputLimit = boostActive ? fmaxf(speedFactor, clampFloat(boost / 100.0f, 0.0f, 1.0f)) : speedFactor;
 
-  fl = clampFloat(fl, -speedFactor, speedFactor);
-  fr = clampFloat(fr, -speedFactor, speedFactor);
-  rl = clampFloat(rl, -speedFactor, speedFactor);
-  rr = clampFloat(rr, -speedFactor, speedFactor);
+  fl = clampFloat(fl, -outputLimit, outputLimit);
+  fr = clampFloat(fr, -outputLimit, outputLimit);
+  rl = clampFloat(rl, -outputLimit, outputLimit);
+  rr = clampFloat(rr, -outputLimit, outputLimit);
 
   digitalWrite(STBY_PIN, HIGH);
+  debugPWM[0] = normalizedToPWM(fl) * (invertFL ? -1 : 1);
+  debugPWM[1] = normalizedToPWM(fr) * (invertFR ? -1 : 1);
+  debugPWM[2] = normalizedToPWM(rl) * (invertRL ? -1 : 1);
+  debugPWM[3] = normalizedToPWM(rr) * (invertRR ? -1 : 1);
   driveOneMotor(CH_FL_1, CH_FL_2, normalizedToPWM(fl), invertFL);
   driveOneMotor(CH_FR_1, CH_FR_2, normalizedToPWM(fr), invertFR);
   driveOneMotor(CH_RL_1, CH_RL_2, normalizedToPWM(rl), invertRL);
@@ -507,6 +547,7 @@ void checkFailsafe() {
   if (!car_enable) return;
 
   if (!validControlPacketReceived || millis() - lastControlPacketMs > COMMAND_TIMEOUT_MS) {
+    debugLog("FAILSAFE: control timeout; motors disabled");
     movey = 0;
     movex = 0;
     turn = 0;
@@ -620,6 +661,7 @@ void handleControl() {
       !server.hasArg("s2_dir") || !server.hasArg("s2_str") ||
       !server.hasArg("en")) {
     server.send(400, "text/plain", "Incomplete control frame");
+    debugLog("CONTROL rejected: incomplete frame");
     return;
   }
 
@@ -640,6 +682,7 @@ void handleControl() {
   movey = clampInt(stick1Y + stick2Y, -100, 100);
   movex = clampInt(stick2X, -100, 100);
   turn = clampInt(stick1Turn, -100, 100);
+  if (car_enable != enable) debugLog(enable ? "CONTROL: motors armed" : "CONTROL: motors disarmed");
   car_enable = enable;
 
   if (!car_enable) {
@@ -696,7 +739,76 @@ void handleSettingsPost() {
   if (server.hasArg("invertMoveX")) invertMoveX = server.arg("invertMoveX").toInt() != 0;
   if (server.hasArg("invertTurn")) invertTurn = server.arg("invertTurn").toInt() != 0;
   saveSettings();
+  debugLog("SETTINGS saved");
   server.send(200, "application/json", buildSettingsJson());
+}
+
+// Incremental log reads are capped at eight lines per HTTP response.
+void handleDebugGet() {
+  expireDebug();
+  if (debugEnabled) debugLastReadMs = millis();
+  uint32_t after = server.hasArg("after") ? strtoul(server.arg("after").c_str(), nullptr, 10) : 0;
+  if (after > debugSequence) after = 0; // device restarted
+  uint32_t oldest = debugSequence > DEBUG_LINES ? debugSequence - DEBUG_LINES + 1 : 1;
+  uint32_t first = after + 1;
+  uint32_t dropped = first < oldest ? oldest - first : 0;
+  if (first < oldest) first = oldest;
+  uint32_t next = after;
+  String json;
+  json.reserve(1800);
+  json += "{\"enabled\":";
+  json += debugEnabled ? "true" : "false";
+  json += ",\"bootId\":" + String(debugBootId) + ",\"dropped\":" + String(dropped) + ",\"lines\":[";
+  int count = 0;
+  for (uint32_t id = first; id <= debugSequence && count < 8; id++, count++) {
+    DebugEntry &entry = debugEntries[(id - 1) % DEBUG_LINES];
+    if (count) json += ',';
+    json += "{\"id\":" + String(id) + ",\"ms\":" + String(entry.ms) + ",\"text\":\"";
+    for (const char *p = entry.text; *p; p++) {
+      if (*p == '"' || *p == '\\') json += '\\';
+      if ((unsigned char)*p >= 32) json += *p;
+    }
+    json += "\"}";
+    next = id;
+  }
+  json += "],\"next\":" + String(next) + "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleDebugPost() {
+  if (!server.hasArg("enabled") || (server.arg("enabled") != "0" && server.arg("enabled") != "1")) {
+    server.send(400, "text/plain", "enabled must be 0 or 1");
+    return;
+  }
+  bool enable = server.arg("enabled") == "1";
+  if (enable && !debugEnabled) {
+    debugEnabled = true;
+    char message[DEBUG_LINE_LENGTH];
+    snprintf(message, sizeof(message), "DEBUG enabled; firmware=%s heap=%u recovery=%d", FW_VERSION, ESP.getFreeHeap(), recoveryMode);
+    debugLog(message);
+    snprintf(message, sizeof(message), "SETTINGS speed=%d start=%d boost=%d boostTime=%d deadzone=%d", speedMode, startMin, boost, boostTime, deadzone);
+    debugLog(message);
+    snprintf(message, sizeof(message), "INVERT motors FL=%d FR=%d RL=%d RR=%d axes Y=%d X=%d turn=%d", invertFL, invertFR, invertRL, invertRR, invertMoveY, invertMoveX, invertTurn);
+    debugLog(message);
+    debugLastStateMs = millis() - 1000;
+  } else if (!enable && debugEnabled) {
+    debugLog("DEBUG disabled");
+    debugEnabled = false;
+  }
+  debugLastReadMs = millis();
+  handleDebugGet();
+}
+
+void recordDebugState() {
+  expireDebug();
+  if (!debugEnabled || millis() - debugLastStateMs < 1000) return;
+  debugLastStateMs = millis();
+  char message[DEBUG_LINE_LENGTH];
+  snprintf(message, sizeof(message), "STATE en=%d Y=%d X=%d turn=%d PWM FL=%d FR=%d RL=%d RR=%d heap=%u wifi=%u age=%lu ms",
+    car_enable, movey, movex, turn, debugPWM[0], debugPWM[1], debugPWM[2], debugPWM[3],
+    ESP.getFreeHeap(), WiFi.softAPgetStationNum(), millis() - lastControlPacketMs);
+  debugLog(message);
 }
 
 bool extractJsonInt(const String &json, const char *key, int &result) {
@@ -1115,6 +1227,8 @@ void setupWiFi() {
 // =====================================================
 
 void setupWebServer() {
+  server.on("/api/debug", HTTP_GET, handleDebugGet);
+  server.on("/api/debug", HTTP_POST, handleDebugPost);
   server.on("/api/control", HTTP_POST, handleControl);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsPost);
@@ -1188,6 +1302,7 @@ void detectRecoveryMode() {
 
 void setup() {
   Serial.begin(115200);
+  debugBootId = esp_random();
   setupMotorHardware();
   detectRecoveryMode();
   disableBluetooth();
@@ -1226,6 +1341,8 @@ void loop() {
     lastControlUpdateMs = now;
     driveMecanum();
   }
+
+  recordDebugState();
 
   if (rebootPending && now >= rebootAtMs) {
     stopAllMotors();

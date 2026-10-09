@@ -38,6 +38,30 @@ MecanumBot_ESP32/
 
 ## Important configuration before first flash
 
+### Motor calibration in firmware 1.0.2
+
+The GPIO profile is calibrated for the reported physical wiring, with all
+motor and axis inversions off. From the three measured tests (left stick up,
+left stick right, right stick right), physical FL was the old RL output with
+reversed polarity, physical FR the old RR output, physical RL the old FR output
+with reversed polarity, and physical RR the old FL output. The resulting pairs
+are FL=4/2, FR=16/17, RL=21/19, RR=5/18 (IN1/IN2).
+
+`python tools/test-motor-mapping.py` checks all sixteen stick sectors against
+that measured wiring and the requested drawing. This verifies the inferred
+mapping, not actual motor motion or wheel roller installation. Retest with
+wheels lifted and all seven inversion switches off: left stick up must drive
+all wheels forward; left stick right must drive the left wheels forward and
+the right wheels backward; right stick right must drive FL/RR forward and
+FR/RL backward. Another vehicle may require different GPIO assignments.
+
+The configured short start boost can now exceed the selected 60%/80% running
+power limit. At the default boost=82 and boostTime=40, starting can reach 82%
+for 120 ms, then returns to the selected limit. Both the boost percentage and
+its duration remain configurable, and the 300 ms control watchdog remains in
+effect. This can help overcome breakaway friction; it does not guarantee that
+the motors can keep running at 60% under the current battery/load conditions.
+
 Edit these values in `MecanumBot.ino`:
 
 ```cpp
@@ -185,6 +209,15 @@ prompt and automatically disarm. Layout checks (including two simultaneous
 touches) can be run with `npm run test:layout` in the website checkout; install
 the browser once with `npx playwright install chromium` if needed.
 
+Web UI 1.2.2 automatically enables motors when a connected, visible landscape
+controller receives a stick deflection. Centering/releasing both sticks stops
+the motors; releasing only one leaves the other stick active. The middle
+button is now a stop button, with **BEREIT / STICK BEWEGEN** shown while idle.
+After manual stop, connection loss, pointer cancellation, hiding the page or
+portrait rotation, any held gestures must be released before fresh input can
+enable motors. Switching tabs also stops driving. This behavior needs only a
+website update and works with the existing firmware control-frame API.
+
 1. Generate/edit the static website.
 2. Put the output in `data/`.
 3. Increase `data/version.txt` independently from `FW_VERSION`.
@@ -196,6 +229,31 @@ the browser once with `npx playwright install chromium` if needed.
 Firmware is not modified by a web update.
 
 ## Firmware updates
+
+### Diagnostics (firmware 1.0.1 / website 1.2.0)
+
+The **Diagnose** tab enables/disables firmware debugging and shows a live
+terminal. Logs include enable/disable events, settings, failsafe stops, input
+axes, signed motor PWM, free heap, connected Wi-Fi clients and command age.
+This is application diagnostics, not a raw serial-console stream.
+
+Debugging starts disabled after boot and is not stored in NVS. The firmware
+keeps 32 entries of at most 159 text bytes and serves at most eight per request.
+The page polls once a second with no overlapping requests and keeps at most
+240 terminal rows. Polling stops while disabled, hidden or outside the tab;
+without a reader the firmware disables logging after ten seconds. Terminal
+output can be cleared; scrolling up pauses automatic following.
+
+`GET /api/debug?after=<last id>` returns `enabled`, `bootId`, `dropped`, `lines`
+(`id`, `ms`, `text`) and `next`. `POST /api/debug?after=<last id>` with a
+form-encoded `enabled=0|1` toggles debugging and returns the same structure.
+The preview labels all generated logs as simulation. Older firmware displays
+a clear firmware-update message instead of a functioning debug switch.
+
+Install both `firmware.bin` and `littlefs.bin` via their separate maintenance
+upload fields, starting with firmware. The firmware was compiled for ESP32 Dev
+Module with Arduino-ESP32 2.0.17 in an isolated build environment; the existing
+legacy LEDC API and custom partition table are retained.
 
 1. Change `FW_VERSION` in `MecanumBot.ino`.
 2. Compile/export the application binary in Arduino IDE.
