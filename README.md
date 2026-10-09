@@ -209,14 +209,24 @@ prompt and automatically disarm. Layout checks (including two simultaneous
 touches) can be run with `npm run test:layout` in the website checkout; install
 the browser once with `npx playwright install chromium` if needed.
 
-Web UI 1.2.2 automatically enables motors when a connected, visible landscape
+Web UI 1.2.3 automatically enables motors when a connected, visible landscape
 controller receives a stick deflection. Centering/releasing both sticks stops
-the motors; releasing only one leaves the other stick active. The middle
+movement immediately; releasing only one leaves the other stick active. The middle
 button is now a stop button, with **BEREIT / STICK BEWEGEN** shown while idle.
 After manual stop, connection loss, pointer cancellation, hiding the page or
 portrait rotation, any held gestures must be released before fresh input can
-enable motors. Switching tabs also stops driving. This behavior needs only a
-website update and works with the existing firmware control-frame API.
+enable motors. Switching tabs also stops driving.
+
+Firmware 1.0.3 and Web UI 1.2.3 delay automatic deactivation after centering or
+releasing both sticks by **10 seconds** by default. Settings -> **FAILSAFE** ->
+**Abschalten nach Loslassen** adjusts this idle period from **0 to 30 seconds**
+in one-second steps; 0 deactivates immediately. Movement restarts the idle
+period. Neutral heartbeats continue during the idle period, and do not restart
+its timer or re-enable a vehicle that the firmware has already deactivated.
+The value is saved in NVS and included in settings export/import and reset.
+Both firmware and website must be updated for this setting. The independent
+300 ms watchdog still stops the vehicle on lost control packets; manual and
+page/orientation safety stops remain immediate.
 
 1. Generate/edit the static website.
 2. Put the output in `data/`.
@@ -227,6 +237,52 @@ website update and works with the existing firmware control-frame API.
 7. Upload only `littlefs.bin` under Webinterface Update.
 
 Firmware is not modified by a web update.
+
+### Guided motor calibration (firmware 1.0.4 / website 1.3.0)
+
+Open **Diagnose -> Kalibrierung**. No rotation sensors are assumed: the user
+directly adjusts output and observes the wheels. The assistant does not claim
+to automatically detect movement or optimal values.
+
+1. **Anlaufen**: hold/drag the power slider upward until the selected wheels
+   start reliably. Release immediately stops and remembers the boost level.
+2. **Weiterlaufen**: hold/drag the power slider. The remembered boost starts
+   the wheels once; lower the running output to find the sustained minimum.
+   Release stops and remembers Start-Minimum.
+3. **Anfahrdauer**: choose 0–300 ms in 3 ms increments and press **Anfahren
+   testen**. One boost impulse is followed by 600 ms at the running minimum.
+   Repeated heartbeats never restart that impulse. Remember the chosen duration.
+4. **Totzone**: with motors stopped, sample relaxed center touches followed by
+   deliberate small movements. The proposal adds two percentage points to the
+   largest relaxed deflection, within 0–30%, and requires deliberate movements
+   to exceed that threshold. Repeat if the two ranges overlap.
+5. **Ergebnis**: review and save only newly remembered values. Other settings,
+   including speed mode, inversion and idle timeout, remain intact.
+
+Motor tests can select all wheels or FL/FR/RL/RR and either direction. For
+each setting the latest observation per selection/direction replaces the
+previous one; the highest remembered value is used for the shared setting.
+Test initially with wheels free, then verify with normal battery/load on the
+floor. Rotation and reliable starting must be judged by the operator.
+
+Calibration sends direct PWM, bypassing the drive mixer, speed cap, response
+curve and minimum-power shaping. Existing motor polarity settings still apply.
+Regular driving heartbeats are paused while the assistant is open. Calibration
+has its own 300 ms command watchdog, a 15-second live-test limit, session tokens
+that are invalidated by stop, and immediate release/cancel/hidden-page/tab/
+portrait stops. Settings updates, firmware updates and reboot cancel motor tests.
+Simulation shows the workflow without driving hardware.
+
+The screen sticks now use the configured deadzone to center the display and
+send raw strength outside it. Firmware rescales the configured deadzone once;
+the former extra fixed 12% frontend rescaling is removed. Update both images.
+
+`POST /api/calibration` uses form fields. `action=start` opens a neutral session
+and returns its token. `action=drive` requires `session`, `sequence`, `mode`
+(`live` or `pulse`), `pwm` (0–100), `boost` (0–100), `boostMs` (0–300), `wheel`
+(0=all, 1=FL, 2=FR, 3=RL, 4=RR), and `reverse` (0/1). `action=stop` always
+stops and invalidates the session. A new sequence starts one test; keepalives
+with the same sequence update running power without restarting its timing.
 
 ## Firmware updates
 
@@ -307,6 +363,7 @@ startMin
 boost
 boostTime
 deadzone
+idleTimeoutSeconds
 invertFL
 invertFR
 invertRL

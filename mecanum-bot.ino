@@ -16,7 +16,7 @@
 // VERSION
 // =====================================================
 
-const char *FW_VERSION = "1.0.2";
+const char *FW_VERSION = "1.0.4";
 
 // =====================================================
 // WIFI ACCESS POINT
@@ -104,6 +104,7 @@ int startMin = 18;
 int boost = 82;
 int boostTime = 40;
 int deadzone = 8;
+int idleTimeoutSeconds = 10;
 
 int invertFL = 0;
 int invertFR = 0;
@@ -124,6 +125,20 @@ const unsigned long CONTROL_INTERVAL_MS = 10;
 unsigned long lastControlPacketMs = 0;
 unsigned long lastControlUpdateMs = 0;
 bool validControlPacketReceived = false;
+bool idleControl = false;
+unsigned long idleControlSinceMs = 0;
+bool calibrationActive = false;
+uint32_t calibrationSession = 0;
+unsigned long calibrationLastPacketMs = 0;
+unsigned long calibrationTestSinceMs = 0;
+int calibrationSequence = -1;
+int calibrationPower = 0;
+int calibrationBoost = 0;
+int calibrationBoostMs = 0;
+int calibrationWheel = 0; // 0=all, 1=FL, 2=FR, 3=RL, 4=RR
+int calibrationSign = 1;
+bool calibrationPulse = false;
+bool calibrationDone = false;
 
 // Bounded diagnostics: no flash writes, no logging while disabled.
 const size_t DEBUG_LINES = 32;
@@ -285,6 +300,7 @@ void setDefaultSettings() {
   boost = 82;
   boostTime = 40;
   deadzone = 8;
+  idleTimeoutSeconds = 10;
   invertFL = 0;
   invertFR = 0;
   invertRL = 0;
@@ -308,6 +324,7 @@ void loadSettings() {
   boost = preferences.getInt("boost", preferences.getInt("bst", boost));
   boostTime = preferences.getInt("boostTime", preferences.getInt("bTime", boostTime));
   deadzone = preferences.getInt("deadzone", preferences.getInt("dz", deadzone));
+  idleTimeoutSeconds = preferences.getInt("idleSeconds", idleTimeoutSeconds);
   invertFL = preferences.getInt("invFL", invertFL);
   invertFR = preferences.getInt("invFR", invertFR);
   invertRL = preferences.getInt("invRL", invertRL);
@@ -322,6 +339,7 @@ void loadSettings() {
   boost = clampInt(boost, 0, 100);
   boostTime = clampInt(boostTime, 0, 100);
   deadzone = clampInt(deadzone, 0, 30);
+  idleTimeoutSeconds = clampInt(idleTimeoutSeconds, 0, 30);
 }
 
 void saveSettings() {
@@ -334,6 +352,7 @@ void saveSettings() {
   preferences.putInt("boostTime", boostTime);
   preferences.putInt("bTime", boostTime);
   preferences.putInt("deadzone", deadzone);
+  preferences.putInt("idleSeconds", idleTimeoutSeconds);
   preferences.putInt("dz", deadzone);
   preferences.putInt("invFL", invertFL);
   preferences.putInt("invFR", invertFR);
@@ -437,6 +456,90 @@ void applyStartMinimum(float &fl, float &fr, float &rl, float &rr, float maximum
   rr *= scale;
 }
 
+void stopCalibration() {
+  calibrationActive = false;
+  calibrationSession = 0;
+  calibrationPower = 0;
+  calibrationSequence = -1;
+  car_enable = 0;
+  movey = movex = turn = 0;
+  stopAllMotors();
+}
+
+void driveCalibration() {
+  unsigned long now = millis();
+  if (recoveryMode || updateInProgress || now - calibrationLastPacketMs > COMMAND_TIMEOUT_MS) {
+    debugLog("CALIBRATION stopped: control timeout or unavailable");
+    stopCalibration();
+    return;
+  }
+  if (calibrationSequence < 0 || calibrationDone) { stopAllMotors(); return; }
+  unsigned long elapsed = now - calibrationTestSinceMs;
+  if (elapsed >= (calibrationPulse ? (unsigned long)calibrationBoostMs + 600UL : 15000UL)) {
+    calibrationDone = true;
+    stopAllMotors();
+    return;
+  }
+  int power = elapsed < (unsigned long)calibrationBoostMs ? calibrationBoost : calibrationPower;
+  int pwm = (power * PWM_MAX / 100) * calibrationSign;
+  digitalWrite(STBY_PIN, power > 0 ? HIGH : LOW);
+  const int ch1[] = {CH_FL_1, CH_FR_1, CH_RL_1, CH_RR_1};
+  const int ch2[] = {CH_FL_2, CH_FR_2, CH_RL_2, CH_RR_2};
+  const int inversions[] = {invertFL, invertFR, invertRL, invertRR};
+  for (int i = 0; i < 4; i++) {
+    int output = calibrationWheel == 0 || calibrationWheel == i + 1 ? pwm : 0;
+    debugPWM[i] = output * (inversions[i] ? -1 : 1);
+    driveOneMotor(ch1[i], ch2[i], output, inversions[i]);
+  }
+}
+
+void handleCalibration() {
+  String action = server.arg("action");
+  if (action == "stop") {
+    stopCalibration();
+    server.send(200, "application/json", "{\"active\":false,\"done\":true}");
+    return;
+  }
+  if (recoveryMode || updateInProgress) { server.send(423, "text/plain", "Vehicle unavailable"); return; }
+  if (action == "start") {
+    if (calibrationActive) { server.send(409, "text/plain", "Calibration already active"); return; }
+    stopCalibration();
+    calibrationSession = esp_random();
+    if (!calibrationSession) calibrationSession = 1;
+    calibrationActive = true;
+    calibrationDone = false;
+    calibrationLastPacketMs = millis();
+    debugLog("CALIBRATION session started");
+  } else if (action == "drive") {
+    if (calibrationActive && millis() - calibrationLastPacketMs > COMMAND_TIMEOUT_MS) stopCalibration();
+    if (!calibrationActive || strtoul(server.arg("session").c_str(), nullptr, 10) != calibrationSession) {
+      server.send(409, "text/plain", "Calibration session expired"); return;
+    }
+    if (!server.hasArg("sequence") || !server.hasArg("pwm") || !server.hasArg("wheel") || !server.hasArg("reverse") ||
+        !server.hasArg("boost") || !server.hasArg("boostMs") || !server.hasArg("mode")) {
+      stopCalibration(); server.send(400, "text/plain", "Incomplete calibration frame"); return;
+    }
+    int sequence = server.arg("sequence").toInt();
+    if (sequence < calibrationSequence) { server.send(409, "text/plain", "Stale calibration frame"); return; }
+    if (sequence != calibrationSequence) {
+      stopAllMotors();
+      calibrationSequence = sequence;
+      calibrationTestSinceMs = millis();
+      calibrationDone = false;
+      calibrationBoost = clampInt(server.arg("boost").toInt(), 0, 100);
+      calibrationBoostMs = clampInt(server.arg("boostMs").toInt(), 0, 300);
+      calibrationWheel = clampInt(server.arg("wheel").toInt(), 0, 4);
+      calibrationSign = server.arg("reverse").toInt() ? -1 : 1;
+      calibrationPulse = server.arg("mode") == "pulse";
+    }
+    calibrationPower = clampInt(server.arg("pwm").toInt(), 0, 100);
+    calibrationLastPacketMs = millis();
+    driveCalibration();
+  } else { server.send(400, "text/plain", "Unknown calibration action"); return; }
+  server.send(200, "application/json", "{\"active\":" + String(calibrationActive ? "true" : "false") +
+    ",\"session\":" + String(calibrationSession) + ",\"done\":" + String(calibrationDone ? "true" : "false") + "}");
+}
+
 void applyGlobalBoost(float &fl, float &fr, float &rl, float &rr, float maximumAllowed) {
   float currentMaximum = getMaxWheelMagnitude(fl, fr, rl, rr);
   bool moving = currentMaximum > 0.001f;
@@ -468,6 +571,7 @@ void applyGlobalBoost(float &fl, float &fr, float &rl, float &rr, float maximumA
 }
 
 void driveMecanum() {
+  if (calibrationActive) { driveCalibration(); return; }
   if (recoveryMode || updateInProgress || !car_enable) {
     stopAllMotors();
     return;
@@ -552,6 +656,12 @@ void checkFailsafe() {
     movex = 0;
     turn = 0;
     car_enable = 0;
+    stopAllMotors();
+  }
+  if (car_enable && idleControl && millis() - idleControlSinceMs >= (unsigned long)idleTimeoutSeconds * 1000UL) {
+    debugLog("FAILSAFE: idle timeout; motors disabled");
+    car_enable = 0;
+    movey = movex = turn = 0;
     stopAllMotors();
   }
 }
@@ -647,6 +757,7 @@ String readWebVersion() {
 // =====================================================
 
 void handleControl() {
+  if (calibrationActive) stopCalibration();
   if (recoveryMode) {
     server.send(423, "text/plain", "Recovery mode active");
     return;
@@ -682,6 +793,19 @@ void handleControl() {
   movey = clampInt(stick1Y + stick2Y, -100, 100);
   movex = clampInt(stick2X, -100, 100);
   turn = clampInt(stick1Turn, -100, 100);
+  bool moving = applyDeadzone(movey, deadzone) != 0 || applyDeadzone(movex, deadzone) != 0 || applyDeadzone(turn, deadzone) != 0;
+  // Neutral heartbeat packets must neither restart the idle clock nor rearm an expired vehicle.
+  if (!enable || moving) {
+    idleControl = false;
+  } else if (car_enable) {
+    if (!idleControl) {
+      idleControl = true;
+      idleControlSinceMs = millis();
+    }
+    if (millis() - idleControlSinceMs >= (unsigned long)idleTimeoutSeconds * 1000UL) enable = 0;
+  } else {
+    enable = 0;
+  }
   if (car_enable != enable) debugLog(enable ? "CONTROL: motors armed" : "CONTROL: motors disarmed");
   car_enable = enable;
 
@@ -690,6 +814,7 @@ void handleControl() {
     movex = 0;
     turn = 0;
   }
+  if (!car_enable || !moving) stopAllMotors();
 
   lastControlPacketMs = millis();
   validControlPacketReceived = true;
@@ -710,6 +835,7 @@ String buildSettingsJson() {
   json += "\"boost\":" + String(boost) + ",";
   json += "\"boostTime\":" + String(boostTime) + ",";
   json += "\"deadzone\":" + String(deadzone) + ",";
+  json += "\"idleTimeoutSeconds\":" + String(idleTimeoutSeconds) + ",";
   json += "\"invertFL\":" + String(invertFL) + ",";
   json += "\"invertFR\":" + String(invertFR) + ",";
   json += "\"invertRL\":" + String(invertRL) + ",";
@@ -726,11 +852,13 @@ void handleSettingsGet() {
 }
 
 void handleSettingsPost() {
+  if (calibrationActive) stopCalibration();
   if (server.hasArg("speedMode")) speedMode = clampInt(server.arg("speedMode").toInt(), 0, 2);
   if (server.hasArg("startMin")) startMin = clampInt(server.arg("startMin").toInt(), 0, 100);
   if (server.hasArg("boost")) boost = clampInt(server.arg("boost").toInt(), 0, 100);
   if (server.hasArg("boostTime")) boostTime = clampInt(server.arg("boostTime").toInt(), 0, 100);
   if (server.hasArg("deadzone")) deadzone = clampInt(server.arg("deadzone").toInt(), 0, 30);
+  if (server.hasArg("idleTimeoutSeconds")) idleTimeoutSeconds = clampInt(server.arg("idleTimeoutSeconds").toInt(), 0, 30);
   if (server.hasArg("invertFL")) invertFL = server.arg("invertFL").toInt() != 0;
   if (server.hasArg("invertFR")) invertFR = server.arg("invertFR").toInt() != 0;
   if (server.hasArg("invertRL")) invertRL = server.arg("invertRL").toInt() != 0;
@@ -787,7 +915,7 @@ void handleDebugPost() {
     char message[DEBUG_LINE_LENGTH];
     snprintf(message, sizeof(message), "DEBUG enabled; firmware=%s heap=%u recovery=%d", FW_VERSION, ESP.getFreeHeap(), recoveryMode);
     debugLog(message);
-    snprintf(message, sizeof(message), "SETTINGS speed=%d start=%d boost=%d boostTime=%d deadzone=%d", speedMode, startMin, boost, boostTime, deadzone);
+    snprintf(message, sizeof(message), "SETTINGS speed=%d start=%d boost=%d boostTime=%d deadzone=%d idleSeconds=%d", speedMode, startMin, boost, boostTime, deadzone, idleTimeoutSeconds);
     debugLog(message);
     snprintf(message, sizeof(message), "INVERT motors FL=%d FR=%d RL=%d RR=%d axes Y=%d X=%d turn=%d", invertFL, invertFR, invertRL, invertRR, invertMoveY, invertMoveX, invertTurn);
     debugLog(message);
@@ -851,6 +979,7 @@ void handleSettingsExport() {
 }
 
 void handleSettingsImport() {
+  if (calibrationActive) stopCalibration();
   if (!requireMaintenanceAuth()) return;
 
   if (!server.hasArg("plain")) {
@@ -867,6 +996,7 @@ void handleSettingsImport() {
   if (extractJsonInt(json, "boost", value)) { boost = clampInt(value, 0, 100); valuesFound++; }
   if (extractJsonInt(json, "boostTime", value)) { boostTime = clampInt(value, 0, 100); valuesFound++; }
   if (extractJsonInt(json, "deadzone", value)) { deadzone = clampInt(value, 0, 30); valuesFound++; }
+  if (extractJsonInt(json, "idleTimeoutSeconds", value)) { idleTimeoutSeconds = clampInt(value, 0, 30); valuesFound++; }
   if (extractJsonInt(json, "invertFL", value)) { invertFL = value != 0; valuesFound++; }
   if (extractJsonInt(json, "invertFR", value)) { invertFR = value != 0; valuesFound++; }
   if (extractJsonInt(json, "invertRL", value)) { invertRL = value != 0; valuesFound++; }
@@ -887,6 +1017,7 @@ void handleSettingsImport() {
 }
 
 void handleSettingsReset() {
+  if (calibrationActive) stopCalibration();
   if (!requireMaintenanceAuth()) return;
   car_enable = 0;
   stopAllMotors();
@@ -974,6 +1105,7 @@ void resetUpdateState() {
 }
 
 bool beginUpdate(int command) {
+  if (calibrationActive) stopCalibration();
   resetUpdateState();
   updateInProgress = true;
   car_enable = 0;
@@ -1157,6 +1289,7 @@ void handleMaintenance() {
 
 void handleReboot() {
   if (!requireMaintenanceAuth()) return;
+  if (calibrationActive) stopCalibration();
 
   car_enable = 0;
   stopAllMotors();
@@ -1230,6 +1363,7 @@ void setupWebServer() {
   server.on("/api/debug", HTTP_GET, handleDebugGet);
   server.on("/api/debug", HTTP_POST, handleDebugPost);
   server.on("/api/control", HTTP_POST, handleControl);
+  server.on("/api/calibration", HTTP_POST, handleCalibration);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsPost);
   server.on("/maintenance", HTTP_GET, handleMaintenance);
